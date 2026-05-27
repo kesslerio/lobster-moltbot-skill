@@ -24,6 +24,7 @@ PAYLOAD_AGENT_TURN = "agentTurn"
 MIN_JOB_ID_PREFIX_LENGTH = 4
 SUBPROCESS_TIMEOUT_SECONDS = 30
 USE_EMOJI = True
+MAX_TIMEOUT_MS = 2_147_483_647
 
 EMOJI = {
     "status_full": "✅",
@@ -414,7 +415,7 @@ steps:
     
   - id: save_state
     command: >-
-      mkdir -p ~/.lobster/state && jq -n --arg cursor "$PROCESS_STDOUT" '{{"cursor": $cursor}}' > ~/.lobster/state/{name}.json
+      mkdir -p ~/.lobster/state && python3 -c 'import json, os; print(json.dumps({{"cursor": os.environ.get("PROCESS_STDOUT", "")}}))' > ~/.lobster/state/{name}.json
     env:
       PROCESS_STDOUT: $process.stdout
 """
@@ -476,8 +477,26 @@ def _is_positive_int(value: Any) -> bool:
     return isinstance(value, int) and not isinstance(value, bool) and value >= 1
 
 
+def _is_timeout_ms(value: Any) -> bool:
+    return _is_positive_int(value) and value <= MAX_TIMEOUT_MS
+
+
 def _is_non_negative_number(value: Any) -> bool:
     return isinstance(value, (int, float)) and not isinstance(value, bool) and value >= 0
+
+
+def _non_empty_string(value: Any) -> bool:
+    return isinstance(value, str) and bool(value.strip())
+
+
+def _validate_execution_string(step_id: str, field: str, value: Any, errors: list[str]) -> None:
+    if value is None:
+        return
+    if not isinstance(value, str):
+        errors.append(f"Step {step_id}: {field} must be a string")
+        return
+    if not value.strip():
+        errors.append(f"Step {step_id}: {field} cannot be blank")
 
 
 def _validate_retry(step_id: str, retry: Any, errors: list[str]) -> None:
@@ -497,19 +516,26 @@ def _validate_retry(step_id: str, retry: Any, errors: list[str]) -> None:
         errors.append(f"Step {step_id}: retry.jitter must be a boolean")
 
 
-def _validate_parallel(step_id: str, parallel: Any, errors: list[str]) -> None:
+def _validate_parallel(
+    step_id: str,
+    parallel: Any,
+    errors: list[str],
+    seen_ids: set[str],
+) -> set[str]:
     if not isinstance(parallel, dict):
         errors.append(f"Step {step_id}: parallel must be an object")
-        return
+        return set()
     if parallel.get("wait") not in [None, "all", "any"]:
         errors.append(f"Step {step_id}: parallel.wait must be 'all' or 'any'")
-    if "timeout_ms" in parallel and not _is_positive_int(parallel["timeout_ms"]):
-        errors.append(f"Step {step_id}: parallel.timeout_ms must be a positive integer")
+    if "timeout_ms" in parallel and not _is_timeout_ms(parallel["timeout_ms"]):
+        errors.append(
+            f"Step {step_id}: parallel.timeout_ms must be a positive integer between 1 and {MAX_TIMEOUT_MS}"
+        )
 
     branches = parallel.get("branches")
     if not isinstance(branches, list) or not branches:
         errors.append(f"Step {step_id}: parallel requires a non-empty branches array")
-        return
+        return set()
 
     branch_ids: set[str] = set()
     for branch in branches:
@@ -517,21 +543,25 @@ def _validate_parallel(step_id: str, parallel: Any, errors: list[str]) -> None:
             errors.append(f"Step {step_id}: parallel branches must be objects")
             continue
         branch_id = branch.get("id")
-        if not isinstance(branch_id, str) or not branch_id:
+        if not _non_empty_string(branch_id):
             errors.append(f"Step {step_id}: parallel branch requires an id")
             branch_id = "unknown"
+        elif branch_id == step_id:
+            errors.append(f"Step {step_id}: parallel branch id cannot match the step id")
         elif branch_id in branch_ids:
             errors.append(f"Step {step_id}: duplicate parallel branch id: {branch_id}")
+        elif branch_id in seen_ids:
+            errors.append(f"Duplicate workflow id across steps/parallel branches: {branch_id}")
         branch_ids.add(str(branch_id))
 
-        exec_count = sum(bool(branch.get(key)) for key in ["run", "command", "pipeline"])
+        exec_count = sum(_non_empty_string(branch.get(key)) for key in ["run", "command", "pipeline"])
         if exec_count == 0:
             errors.append(f"Step {step_id}: parallel branch {branch_id} requires run, command, or pipeline")
         if exec_count > 1:
             errors.append(f"Step {step_id}: parallel branch {branch_id} can only define one of run, command, or pipeline")
         for key in ["run", "command", "pipeline"]:
-            if key in branch and not isinstance(branch[key], str):
-                errors.append(f"Step {step_id}: parallel branch {branch_id} {key} must be a string")
+            _validate_execution_string(f"{step_id} parallel branch {branch_id}", key, branch.get(key), errors)
+    return branch_ids
 
 
 def _validate_for_each(step_id: str, step: dict[str, Any], errors: list[str]) -> None:
@@ -541,6 +571,12 @@ def _validate_for_each(step_id: str, step: dict[str, Any], errors: list[str]) ->
         errors.append(f"Step {step_id}: batch_size must be a positive integer")
     if "pause_ms" in step and not _is_non_negative_number(step["pause_ms"]):
         errors.append(f"Step {step_id}: pause_ms must be a non-negative number")
+    if _has_approval(step.get("approval")):
+        errors.append(f"Step {step_id}: for_each steps cannot define approval")
+    if _has_input(step.get("input")):
+        errors.append(f"Step {step_id}: for_each steps cannot define input")
+    if step.get("stdin") is not None:
+        errors.append(f"Step {step_id}: for_each steps cannot define stdin")
 
     sub_steps = step.get("steps")
     if not isinstance(sub_steps, list) or not sub_steps:
@@ -553,7 +589,7 @@ def _validate_for_each(step_id: str, step: dict[str, Any], errors: list[str]) ->
             errors.append(f"Step {step_id}: for_each sub-steps must be objects")
             continue
         sub_id = sub.get("id")
-        if not isinstance(sub_id, str) or not sub_id:
+        if not _non_empty_string(sub_id):
             errors.append(f"Step {step_id}: for_each sub-step requires an id")
             sub_id = "unknown"
         elif sub_id in sub_ids:
@@ -562,24 +598,52 @@ def _validate_for_each(step_id: str, step: dict[str, Any], errors: list[str]) ->
 
         if _has_approval(sub.get("approval")) or _has_input(sub.get("input")):
             errors.append(f"Step {step_id}: for_each sub-step {sub_id} cannot define approval or input")
-        exec_count = sum(bool(sub.get(key)) for key in ["run", "command", "pipeline"])
+        if sub.get("workflow") is not None or sub.get("parallel") is not None or sub.get("for_each") is not None:
+            errors.append(f"Step {step_id}: for_each sub-step {sub_id} cannot define workflow, parallel, or for_each")
+        exec_count = sum(_non_empty_string(sub.get(key)) for key in ["run", "command", "pipeline"])
         if exec_count == 0:
             errors.append(f"Step {step_id}: for_each sub-step {sub_id} requires run, command, or pipeline")
         if exec_count > 1:
             errors.append(f"Step {step_id}: for_each sub-step {sub_id} can only define one of run, command, or pipeline")
+        for key in ["run", "command", "pipeline"]:
+            _validate_execution_string(f"{step_id} for_each sub-step {sub_id}", key, sub.get(key), errors)
 
 
-def _validate_step_shape(step: Any, index: int, errors: list[str], warnings: list[str]) -> None:
+def _validate_input(step_id: str, input_value: Any, errors: list[str]) -> None:
+    if input_value is None:
+        return
+    if not isinstance(input_value, dict):
+        errors.append(f"Step {step_id}: input must be an object")
+        return
+    if not isinstance(input_value.get("prompt"), str):
+        errors.append(f"Step {step_id}: input.prompt must be a string")
+    if not isinstance(input_value.get("responseSchema"), dict):
+        errors.append(f"Step {step_id}: input.responseSchema must be an object")
+
+
+def _validate_step_shape(
+    step: Any,
+    index: int,
+    errors: list[str],
+    warnings: list[str],
+    seen_ids: set[str],
+) -> None:
     if not isinstance(step, dict):
         errors.append(f"Step {index}: Step must be an object")
         return
 
     step_id = step.get("id", f"step_{index}")
-    if not isinstance(step.get("id"), str) or not step.get("id"):
+    if not _non_empty_string(step.get("id")):
         errors.append(f"Step {index}: Missing 'id'")
+    elif step_id in seen_ids:
+        errors.append(f"Duplicate workflow step id: {step_id}")
 
     execution_keys = ["run", "command", "pipeline", "workflow", "parallel", "for_each"]
-    execution_count = sum(step.get(key) is not None for key in execution_keys)
+    execution_count = (
+        sum(_non_empty_string(step.get(key)) for key in ["run", "command", "pipeline", "workflow"])
+        + int(step.get("parallel") is not None)
+        + int(step.get("for_each") is not None)
+    )
     has_approval = _has_approval(step.get("approval"))
     has_input = _has_input(step.get("input"))
 
@@ -597,18 +661,19 @@ def _validate_step_shape(step: Any, index: int, errors: list[str], warnings: lis
         errors.append(f"Step {step_id}: cannot define both approval and input")
 
     for key in ["run", "command", "pipeline", "workflow"]:
-        if key in step and step[key] is not None and not isinstance(step[key], str):
-            errors.append(f"Step {step_id}: {key} must be a string")
+        _validate_execution_string(str(step_id), key, step.get(key), errors)
 
+    branch_ids: set[str] = set()
     if "parallel" in step and step["parallel"] is not None:
-        _validate_parallel(str(step_id), step["parallel"], errors)
+        branch_ids = _validate_parallel(str(step_id), step["parallel"], errors, seen_ids)
     if "for_each" in step and step["for_each"] is not None:
         _validate_for_each(str(step_id), step, errors)
+    _validate_input(str(step_id), step.get("input"), errors)
 
     if "workflow_args" in step and not isinstance(step["workflow_args"], dict):
         errors.append(f"Step {step_id}: workflow_args must be an object")
-    if "timeout_ms" in step and not _is_positive_int(step["timeout_ms"]):
-        errors.append(f"Step {step_id}: timeout_ms must be a positive integer")
+    if "timeout_ms" in step and not _is_timeout_ms(step["timeout_ms"]):
+        errors.append(f"Step {step_id}: timeout_ms must be a positive integer between 1 and {MAX_TIMEOUT_MS}")
     if "on_error" in step and step["on_error"] not in ["stop", "continue", "skip_rest"]:
         errors.append(f"Step {step_id}: on_error must be 'stop', 'continue', or 'skip_rest'")
     if "retry" in step:
@@ -621,6 +686,10 @@ def _validate_step_shape(step: Any, index: int, errors: list[str], warnings: lis
         condition = step.get(condition_key)
         if condition is not None and not isinstance(condition, (str, bool)):
             warnings.append(f"Step {step_id}: {condition_key} should be string or boolean")
+
+    if _non_empty_string(step_id):
+        seen_ids.add(str(step_id))
+    seen_ids.update(branch_ids)
 
 
 def cmd_validate(args: argparse.Namespace) -> int:
@@ -688,8 +757,9 @@ def cmd_validate(args: argparse.Namespace) -> int:
         errors.append("No steps defined in workflow")
     
     # Validate steps
+    seen_ids: set[str] = set()
     for i, step in enumerate(steps):
-        _validate_step_shape(step, i, errors, warnings)
+        _validate_step_shape(step, i, errors, warnings, seen_ids)
     
     # Report results
     if errors:
