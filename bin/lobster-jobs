@@ -573,7 +573,7 @@ def _validate_for_each(step_id: str, step: dict[str, Any], errors: list[str]) ->
         errors.append(f"Step {step_id}: pause_ms must be a non-negative number")
     if _has_approval(step.get("approval")):
         errors.append(f"Step {step_id}: for_each steps cannot define approval")
-    if step.get("input") is not None:
+    if "input" in step:
         errors.append(f"Step {step_id}: for_each steps cannot define input")
     if step.get("stdin") is not None:
         errors.append(f"Step {step_id}: for_each steps cannot define stdin")
@@ -596,7 +596,7 @@ def _validate_for_each(step_id: str, step: dict[str, Any], errors: list[str]) ->
             errors.append(f"Step {step_id}: duplicate for_each sub-step id: {sub_id}")
         sub_ids.add(str(sub_id))
 
-        if _has_approval(sub.get("approval")) or sub.get("input") is not None:
+        if _has_approval(sub.get("approval")) or "input" in sub:
             errors.append(f"Step {step_id}: for_each sub-step {sub_id} cannot define approval or input")
         if sub.get("workflow") is not None or sub.get("parallel") is not None or sub.get("for_each") is not None:
             errors.append(f"Step {step_id}: for_each sub-step {sub_id} cannot define workflow, parallel, or for_each")
