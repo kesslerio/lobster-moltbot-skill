@@ -565,15 +565,15 @@ def _validate_parallel(
 
 
 def _validate_for_each(step_id: str, step: dict[str, Any], errors: list[str]) -> None:
-    if not isinstance(step.get("for_each"), str):
-        errors.append(f"Step {step_id}: for_each must be a string")
+    if not _non_empty_string(step.get("for_each")):
+        errors.append(f"Step {step_id}: for_each must be a non-empty string")
     if "batch_size" in step and not _is_positive_int(step["batch_size"]):
         errors.append(f"Step {step_id}: batch_size must be a positive integer")
     if "pause_ms" in step and not _is_non_negative_number(step["pause_ms"]):
         errors.append(f"Step {step_id}: pause_ms must be a non-negative number")
     if _has_approval(step.get("approval")):
         errors.append(f"Step {step_id}: for_each steps cannot define approval")
-    if _has_input(step.get("input")):
+    if step.get("input") is not None:
         errors.append(f"Step {step_id}: for_each steps cannot define input")
     if step.get("stdin") is not None:
         errors.append(f"Step {step_id}: for_each steps cannot define stdin")
@@ -596,7 +596,7 @@ def _validate_for_each(step_id: str, step: dict[str, Any], errors: list[str]) ->
             errors.append(f"Step {step_id}: duplicate for_each sub-step id: {sub_id}")
         sub_ids.add(str(sub_id))
 
-        if _has_approval(sub.get("approval")) or _has_input(sub.get("input")):
+        if _has_approval(sub.get("approval")) or sub.get("input") is not None:
             errors.append(f"Step {step_id}: for_each sub-step {sub_id} cannot define approval or input")
         if sub.get("workflow") is not None or sub.get("parallel") is not None or sub.get("for_each") is not None:
             errors.append(f"Step {step_id}: for_each sub-step {sub_id} cannot define workflow, parallel, or for_each")
@@ -615,8 +615,8 @@ def _validate_input(step_id: str, input_value: Any, errors: list[str]) -> None:
     if not isinstance(input_value, dict):
         errors.append(f"Step {step_id}: input must be an object")
         return
-    if not isinstance(input_value.get("prompt"), str):
-        errors.append(f"Step {step_id}: input.prompt must be a string")
+    if not _non_empty_string(input_value.get("prompt")):
+        errors.append(f"Step {step_id}: input.prompt must be a non-empty string")
     if not isinstance(input_value.get("responseSchema"), dict):
         errors.append(f"Step {step_id}: input.responseSchema must be an object")
 
